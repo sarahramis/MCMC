@@ -1,0 +1,177 @@
+import jax
+import jax.numpy as jnp
+from jax import random
+from flax import linen as nn
+from jax.scipy.special import logsumexp
+from jax import random, vmap
+from jax.scipy.stats import norm
+import numpy as np
+from jax import grad
+from jax import jit, value_and_grad
+import optax
+
+
+def rescorla_wagner(V_initial, alpha, beta, stimuli, rewards):
+    """
+    Simulate the Rescorla-Wagner model.
+    :param V_initial: Initial value estimate.
+    :param alpha: Learning rate for the prediction error.
+    :param beta: Learning rate for the stimulus.
+    :param stimuli: Array of stimuli presented (0 or 1).
+    :param rewards: Array of received rewards.
+    :return: Array of predicted values.
+    """
+    V = V_initial
+    predictions = []
+    for stimulus, reward in zip(stimuli, rewards):
+        prediction = V * stimulus
+        predictions.append(prediction)
+        V += alpha * beta * (reward - prediction) * stimulus
+    return jnp.array(predictions)
+
+def simulate_rescorla_wagner(trials, alpha, beta, p_reward=0.5, initial_value=0.0, noise_level=0.0):
+    """
+    Simulate the Rescorla-Wagner model with enhancements.
+
+    Parameters:
+    - trials: int, number of trials to simulate.
+    - alpha: float, learning rate for the prediction error.
+    - beta: float, influence rate of the stimulus.
+    - p_reward: float, probability of receiving a reward (dynamic or static).
+    - initial_value: float, starting value for V.
+    - noise_level: float, standard deviation of Gaussian noise added to each update.
+
+    Returns:
+    - V: np.array, values learned over trials.
+    - X: np.array, presence of stimuli in each trial.
+    - R: np.array, rewards received in each trial.
+    """
+    V = np.full(trials, initial_value)  # Initial values array
+    X = np.random.choice([0, 1], size=trials)  # Stimuli presence
+    R = np.random.binomial(1, p_reward, size=trials)  # Rewards based on given probability
+
+    for t in range(1, trials):
+        # Update rule with noise
+        prediction_error = (R[t-1] - V[t-1]) * X[t-1]
+        update = alpha * beta * prediction_error
+        noise = np.random.normal(0, noise_level)  # Gaussian noise
+        V[t] = V[t-1] + update + noise
+
+    return V, X, R
+
+class MaskedDense(nn.Module):
+    features: int
+    out_features: int
+    kernel_init: Callable[..., Any] = nn.initializers.lecun_normal()
+    bias_init: Callable[..., Any] = nn.initializers.zeros
+
+    @nn.compact
+    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        mask = jnp.tril(jnp.ones((self.features, self.out_features)), -1)
+        kernel = self.param('kernel', self.kernel_init, (self.features, self.out_features))
+        bias = self.param('bias', self.bias_init, (self.out_features,))
+        masked_kernel = jnp.multiply(mask, kernel)
+        return jnp.dot(inputs, masked_kernel) + bias
+
+class TwoParamMAF(nn.Module):
+    features: int
+    hidden_units: int
+    num_blocks: int
+
+    @nn.compact
+    def __call__(self, x):
+        print("Input x shape:", x.shape)
+        key = self.make_rng('noise')
+        # Process x through the model...
+        for i in range(self.num_blocks):
+            x = nn.leaky_relu(MaskedDense(features=x.shape[-1], out_features=self.hidden_units)(x), negative_slope=0.01)
+            print(f"Hidden layer {i+1} shape after leaky_relu:", x.shape)
+            # Split key for each use in the loop
+            key, subkey = jax.random.split(key)
+
+        # Assume 'shift', 'log_scale', and other calculations are correctly defined.
+        log_scale = MaskedDense(features=self.hidden_units, out_features=self.features)(x)
+        shift = MaskedDense(features=self.hidden_units, out_features=self.features)(x)
+        print("Log scale shape:", log_scale.shape)
+        print("Shift shape:", shift.shape)
+
+        z = shift * jnp.exp(log_scale) + random.normal(key, shift.shape) * 0.1
+        alpha = nn.sigmoid(z[:, 0])
+        beta = nn.softplus(z[:, 1])
+        log_det_jacobian = jnp.sum(log_scale, axis=-1)
+        # Here, ensure all four outputs are correctly returned
+        samples = jnp.zeros_like(alpha) 
+        print(f"Samples: {samples}, Alpha: {alpha}, Beta: {beta}, LogDetJacobian: {log_det_jacobian}")
+        # Placeholder if actual samples computation is not defined
+        return samples, alpha, beta, log_det_jacobian
+
+def train_maf(rng, model, X, R, epochs=100):
+    X = X.reshape(-1, 2)
+    R = R.reshape(-1, 1)
+
+    init_rng, noise_rng = random.split(rng)
+    params = model.init({'params': init_rng, 'noise': noise_rng}, X)
+
+    optimizer = optax.adam(learning_rate=0.001)
+    opt_state = optimizer.init(params)
+
+    def loss_fn(params, rng, X, R):
+        _, noise_rng = random.split(rng)  # Split RNG for each epoch
+        Samples, alpha, beta, log_det_jacobian = model.apply(params, X, rngs={'noise': noise_rng})
+        return jnp.mean((alpha - R) ** 2)
+
+    @jit
+    def step(rng, params, opt_state, X, R):
+        grads = grad(loss_fn)(params, rng, X, R)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state
+
+    for epoch in range(epochs):
+        rng, step_rng = random.split(rng)
+        params, opt_state = step(step_rng, params, opt_state, X, R)
+        if epoch % 10 == 0:
+            loss = loss_fn(params, step_rng, X, R)
+            print(f"Epoch {epoch}: Loss {loss}")
+
+    return params
+
+trials = 10000
+alpha = 0.3
+beta = 0.5
+p_reward = 0.5  # Constant probability of reward
+initial_value = 0.0  # Start learning from no prior knowledge
+noise_level = 0.01  # Some noise to simulate variability in learning
+
+V, X, R = simulate_rescorla_wagner(trials, alpha, beta, p_reward, initial_value, noise_level)
+
+# You might want to plot V to see how it evolves
+import matplotlib.pyplot as plt
+plt.plot(V)
+plt.title('Learned Values Over Trials')
+plt.xlabel('Trial')
+plt.ylabel('Value')
+plt.show()
+
+rng = random.PRNGKey(0)
+model = TwoParamMAF(features=2, hidden_units=10, num_blocks=3)
+X = jnp.array([[0.1, 0.2], [0.2, 0.3]])
+R = jnp.array([0.3, 0.5])
+trained_params = train_maf(rng, model, X, R, epochs=100)
+
+new_rng = random.PRNGKey(0)
+
+trained_params = train_maf(rng, model, X, R, epochs=100)
+
+
+_, noise_rng = random.split(rng)  # Ensure you are using a fresh split for application
+samples, estimated_alpha, estimated_beta, log_det_jacobian = model.apply(
+    trained_params, dummy_input, rngs={'noise': noise_rng}
+
+print("True alpha:", alpha, "Estimated alpha:", estimated_alpha)
+print("True beta:", beta, "Estimated beta:", estimated_beta)
+
+# Quantitative comparison
+mse_alpha = np.mean((alpha - estimated_alpha) ** 2)
+mse_beta = np.mean((beta - estimated_beta) ** 2)
+print("MSE Alpha:", mse_alpha, "MSE Beta:", mse_beta)
