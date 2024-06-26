@@ -65,14 +65,18 @@ class MaskedDense(nn.Module):
     kernel_init: Callable[..., Any] = nn.initializers.lecun_normal()
     bias_init: Callable[..., Any] = nn.initializers.zeros
 
+    def setup(self):
+        self.mask = jnp.tril(jnp.ones((self.features, self.out_features)), -1)
+
     @nn.compact
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-        mask = jnp.tril(jnp.ones((self.features, self.out_features)), -1)
+        print("Input shape to MaskedDense:", inputs.shape)  # Debugging line
         kernel = self.param('kernel', self.kernel_init, (self.features, self.out_features))
         bias = self.param('bias', self.bias_init, (self.out_features,))
-        masked_kernel = jnp.multiply(mask, kernel)
-        return jnp.dot(inputs, masked_kernel) + bias
-
+        masked_kernel = jnp.multiply(self.mask, kernel)
+        outputs = jnp.dot(inputs, masked_kernel) + bias
+        print(f"Output shape in MaskedDense: {outputs.shape}")  # Debugging line
+        return outputs
 class TwoParamMAF(nn.Module):
     features: int
     hidden_units: int
@@ -80,59 +84,109 @@ class TwoParamMAF(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        print("Input x shape:", x.shape)
         key = self.make_rng('noise')
-        # Process x through the model...
-        for i in range(self.num_blocks):
-            x = nn.leaky_relu(MaskedDense(features=x.shape[-1], out_features=self.hidden_units)(x), negative_slope=0.01)
-            print(f"Hidden layer {i+1} shape after leaky_relu:", x.shape)
-            # Split key for each use in the loop
-            key, subkey = jax.random.split(key)
+        print("Initial input x shape:", x.shape)
 
-        # Assume 'shift', 'log_scale', and other calculations are correctly defined.
-        log_scale = MaskedDense(features=self.hidden_units, out_features=self.features)(x)
-        shift = MaskedDense(features=self.hidden_units, out_features=self.features)(x)
+        
+        print(f"Input shape: {x.shape}")  # Debugging statement
+        for i in range(self.num_blocks):
+            # print(f"Input shape to MaskedDense: {x.shape}")
+            # x = nn.leaky_relu(MaskedDense(features=x.shape[-1], out_features=self.hidden_units)(x), negative_slope=0.01)
+            # print(f"Shape after block {i + 1}: {x.shape}")  # Check shape
+            x = nn.leaky_relu(MaskedDense(features=x.shape[-1], out_features=self.hidden_units)(x), negative_slope=0.01)
+            print(f"Shape after block {i + 1}: {x.shape}")
+
+        log_scale = MaskedDense(self.hidden_units, self.features)(x)
+        shift = MaskedDense(self.hidden_units, self.features)(x)
+        # shift = MaskedDense(self.hidden_units, self.features)(x)
+        print("Shift shape:", shift.shape)  # Should be (batch_size, num_features) with num_features >= 2
+
+        if shift.shape[-1] < 2:
+            raise ValueError("Shift output must have at least two features for alpha and beta computations.")
+
+        # log_scale = MaskedDense(self.hidden_units, self.features)(x)
+        # shift = MaskedDense(self.hidden_units, self.features)(x)
         print("Log scale shape:", log_scale.shape)
         print("Shift shape:", shift.shape)
 
         z = shift * jnp.exp(log_scale) + random.normal(key, shift.shape) * 0.1
-        alpha = nn.sigmoid(z[:, 0])
-        beta = nn.softplus(z[:, 1])
+        print("Z shape:", z.shape)
+
+        # Ensure element-wise transformation
+        alpha = nn.sigmoid(z[..., 0])  # Assuming the first column is for alpha
+        beta = nn.softplus(z [..., 1])  # Assuming the second column is for beta
+
+        print("Alpha shape:", alpha.shape)
+        print("Beta shape:", beta.shape)
+        print("Alpha shape:", alpha.shape)
+        if alpha.ndim == 0:
+            raise ValueError("Alpha is a scalar, expected at least a 1D array.")
+
+  
+        print("Key type:", type(key))
+
         log_det_jacobian = jnp.sum(log_scale, axis=-1)
-        # Here, ensure all four outputs are correctly returned
-        samples = jnp.zeros_like(alpha) 
-        print(f"Samples: {samples}, Alpha: {alpha}, Beta: {beta}, LogDetJacobian: {log_det_jacobian}")
-        # Placeholder if actual samples computation is not defined
+        rng_keys = random.split(key, num=alpha.shape[0])  # Split keys for each alpha/beta pair
+        # def draw_beta_samples(key, alpha, beta):
+        #     return random.beta(key, alpha, beta, shape=(100,))
+
+        # # Vectorize this function across batches
+        # draw_beta_samples_batched = vmap(draw_beta_samples, in_axes=(0, 0, 0))
+
+        # # Now apply this vectorized function
+        # samples = draw_beta_samples_batched(rng_keys, alpha, beta)
+        samples = vmap(lambda k, a, b: random.beta(k, a, b, shape=(100,)), in_axes=(0, 0, 0))(rng_keys, alpha, beta)
+        # samples = draw_beta_samples_batched(rng_keys, alpha, beta, 100)
+        
+
+    
         return samples, alpha, beta, log_det_jacobian
 
-def train_maf(rng, model, X, R, epochs=100):
-    X = X.reshape(-1, 2)
-    R = R.reshape(-1, 1)
+def data_loader(X, R, batch_size):
+    num_samples = X.shape[0]
+    for i in range(0, num_samples, batch_size):
+        X_batch = X[i:i + batch_size]
+        R_batch = R[i:i + batch_size]
+        if R_batch.ndim == 1:
+            R_batch = R_batch[:, None]  # Ensure R_batch is always 2-dimensional for consistency
+        yield X_batch, R_batch
 
+def draw_beta_samples(key, alpha, beta, num_samples=100):
+    # Returns samples of shape (num_samples,) for each alpha/beta pair
+    return random.beta(key, alpha, beta, shape=(num_samples,))
+draw_beta_samples_batched = vmap(draw_beta_samples, in_axes=(0, 0, 0, None))
+
+def train_maf(rng, model, X, R, epochs=30):
     init_rng, noise_rng = random.split(rng)
     params = model.init({'params': init_rng, 'noise': noise_rng}, X)
-
-    optimizer = optax.adam(learning_rate=0.001)
+    optimizer = optax.adam(learning_rate=0.0000001)
     opt_state = optimizer.init(params)
 
     def loss_fn(params, rng, X, R):
-        _, noise_rng = random.split(rng)  # Split RNG for each epoch
-        Samples, alpha, beta, log_det_jacobian = model.apply(params, X, rngs={'noise': noise_rng})
-        return jnp.mean((alpha - R) ** 2)
+        _, noise_rng = random.split(rng)
+        samples, alpha, beta, log_det_jacobian = model.apply(params, X, rngs={'noise': noise_rng})
 
+        # Compute the negative log-likelihood as the loss
+        R = jnp.clip(R, 1e-6, 1 - 1e-6)  # Avoid log(0)
+        log_likelihood = (alpha - 1) * jnp.log(R) + (beta - 1) * jnp.log(1 - R) - jax.scipy.special.betaln(alpha, beta)
+        loss = -jnp.mean(log_likelihood)
+
+        return loss, log_det_jacobian 
     @jit
     def step(rng, params, opt_state, X, R):
         grads = grad(loss_fn)(params, rng, X, R)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state
-
+    grad_fn = value_and_grad(loss_fn, has_aux=True)
     for epoch in range(epochs):
-        rng, step_rng = random.split(rng)
-        params, opt_state = step(step_rng, params, opt_state, X, R)
-        if epoch % 10 == 0:
-            loss = loss_fn(params, step_rng, X, R)
-            print(f"Epoch {epoch}: Loss {loss}")
+        for X_batch, R_batch in data_loader(X, R, 1000):
+            rng, step_rng = random.split(rng)
+            (loss, aux_output), grads = grad_fn(params, step_rng, X_batch, R_batch)  # Note how the outputs are unpacked
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}, Loss: {loss}, Aux: {aux_output}")
 
     return params
 
@@ -142,6 +196,7 @@ beta = 0.5
 p_reward = 0.5  # Constant probability of reward
 initial_value = 0.0  # Start learning from no prior knowledge
 noise_level = 0.01  # Some noise to simulate variability in learning
+batch_size=1000
 
 V, X, R = simulate_rescorla_wagner(trials, alpha, beta, p_reward, initial_value, noise_level)
 
@@ -153,20 +208,21 @@ plt.xlabel('Trial')
 plt.ylabel('Value')
 plt.show()
 
+X = X.reshape(-1, 2)  
+R = R.reshape(-1, 1) 
+
 rng = random.PRNGKey(0)
 model = TwoParamMAF(features=2, hidden_units=10, num_blocks=3)
-X = jnp.array([[0.1, 0.2], [0.2, 0.3]])
-R = jnp.array([0.3, 0.5])
-trained_params = train_maf(rng, model, X, R, epochs=100)
+trained_params = train_maf(rng, model, X, R, epochs=30)
 
-new_rng = random.PRNGKey(0)
+dummy_input = jnp.zeros((5, model.features))  # Ensure this matches the 'features' size expected by the model
 
-trained_params = train_maf(rng, model, X, R, epochs=100)
-
-
+# Make sure to use a new split or a properly managed RNG key for application
 _, noise_rng = random.split(rng)  # Ensure you are using a fresh split for application
 samples, estimated_alpha, estimated_beta, log_det_jacobian = model.apply(
     trained_params, dummy_input, rngs={'noise': noise_rng}
+)
+
 
 print("True alpha:", alpha, "Estimated alpha:", estimated_alpha)
 print("True beta:", beta, "Estimated beta:", estimated_beta)
